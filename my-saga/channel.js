@@ -21,7 +21,7 @@ export const stdChannel = () => {
 const channel = stdChannel();
 
 function next() {
-  console.log('continue');
+
 }
 function matcher(input) {
   return input.type === 'ASYNC_ADD';
