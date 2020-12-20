@@ -22,6 +22,7 @@ function* addOne() {
   yield put({
     type: 'ADD_ONE',
   });
+  return 'aa';
 }
 
 function* aaa() {}
@@ -32,7 +33,8 @@ function* bbb() {}
 */
 function* mySaga() {
   yield fork(saga1);
-  yield fork(saga2);
+  const addOneRes = yield* addOne();
+  console.log('addOneRes:', addOneRes);
   yield takeEvery("FETCH_USER", fetchUser);
   yield takeEvery("ADD_ONE_SAGA", addOne);
 }

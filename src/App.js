@@ -3,21 +3,21 @@ import React from 'react';
 
 function App(props) {
   const { main, dispatch } = props;
-  const addOne = () => {
+  const login = () => {
     dispatch({
-      type: 'ADD_ONE_SAGA',
+      type: 'login',
     });
   }
-  const fetchUser = () => {
+  const logout = () => {
     dispatch({
-      type: 'FETCH_USER'
+      type: 'logout'
     })
   }
   return (
     <div className="App">
-      <button onClick={addOne}>Add</button>
+      <button onClick={login}>login</button>
       {main.count}
-      <button onClick={fetchUser}>fetch user</button>
+      <button onClick={logout}>logout</button>
       {main.user}
     </div>
   );

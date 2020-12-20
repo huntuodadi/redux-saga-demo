@@ -1,6 +1,77 @@
 # Redux-saga 原理
 
-## 从指令入手
+## 前置知识
+
+redux-saga本质就是一个generator函数，我们先简单回顾以下generator函数
+
+### generator基本语法
+
+```javascript
+function* simpleGenerator() {
+  const value1 = yield 1;
+  const value2 = yield 'zy.zhang';
+  const value3 = yield 2;
+}
+const iterator = simpleGenerator();
+console.log(iterator.next()); //{ value: 1, done: false }
+console.log(iterator.next()); //{ value: 'zy.zhang', done: false }
+console.log(iterator.next()); //{ value: 2, done: false }
+console.log(iterator.next()); //{ value: undefined, done: true }
+```
+
+[演示demo-generator.js]()
+
+### generator函数自动执行
+
+自动执行generator，通过递归next实现
+
+```javascript
+function autoRun(generator) {
+  const it = generator();
+  let result;
+  function next(arg) {
+    result = it.next(arg);
+    if(!result.done) {
+      next(result.value);
+    }
+  }
+  next();
+}
+```
+
+[演示demo-simple-co.js]()
+
+### 能处理promise的co函数
+
+```javascript
+function co(gen) {
+  var ctx = this;
+  return new Promise(function(resolve, reject) {
+    if (typeof gen === 'function') gen = gen.call(ctx);
+    if (!gen || typeof gen.next !== 'function') return resolve(gen);
+
+    onFulfilled();
+    function next(ret) {
+      if (ret.done) return resolve(ret.value);
+      const { value } = ret;
+      if (value && isPromise(value)) return value.then(onFulfilled);
+    }
+    function onFulfilled(res) {
+      var ret;
+      try {
+        ret = gen.next(res);
+      } catch (e) {
+        return reject(e);
+      }
+      next(ret);
+    }
+  });
+}
+```
+
+[演示demo-co.js]()
+
+## redux-saga effects
 
 ```javascript
 call(fetchUserApi)
@@ -14,7 +85,7 @@ takeEvery("FETCH_USER", fetchUser);
 
 ```
 
-effects中返回的各种方法类似于actionCreator，类比到saga这里的作用是生成各种effect指令，接下来会根据各种指令做不同的操作。
+effects是一个纯对象，{type, payload}表示saga里的各种指令，可以理解为针对当前类型(type)的指令我要处理哪些数据(payload)
 
 ## 核心流程
 
@@ -34,14 +105,11 @@ function sagaMiddleware({ getState, dispatch }) {
     })
 
     return next => action => {
-      if (sagaMonitor && sagaMonitor.actionDispatched) {
-        sagaMonitor.actionDispatched(action)
-      }
       const result = next(action) // hit reducers
       channel.put(action)
       return result
     }
-  }
+}
 
   sagaMiddleware.run = (...args) => {
     if (process.env.NODE_ENV !== 'production' && !boundRunSaga) {
@@ -51,7 +119,7 @@ function sagaMiddleware({ getState, dispatch }) {
   }
 ```
 
-这里通过
+redux中间件写法参考[Redux实现原理](http://git.dev.sh.ctripcorp.com/ibu-framework/ibu-tech-talk/tree/master/article/2020-10-27_Redux%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86)
 
 ```javascript
 boundRunSaga = runSaga.bind(null, {
@@ -86,6 +154,7 @@ boundRunSaga = runSaga.bind(null, {
 ```
 
 ```javascript
+  const iterator = saga(...args);
   if (effectMiddlewares) {
     const middleware = compose(...effectMiddlewares)
     finalizeRunEffect = runEffect => {
@@ -106,92 +175,141 @@ boundRunSaga = runSaga.bind(null, {
 
 proc.js是saga运行的核心流程
 
-在上一步我们执行了saga得到了iterator,这个时候代码停留在了
+看下面一段代码
 
 ```javascript
 function* mySaga() {
-  yield takeEvery("FETCH_USER", fetchUser);
-  yield take("ADD_ONE_SAGA", addOne);
+  yield take('MY_TAKE1');
+  // some code
+  yield take('MY_TAKE2');
+  // some code
 }
 ```
 
-第一个yield这里。接下里我们要take多个指令，所以我们希望我们的generator函数能自动执行。
-
-类似co函数，saga里根据自身的业务做了一些变体
-
 ```javascript
-  // 简化版
-  function next(arg, isErr) {
-    let result
-    if (shouldTerminate(arg)) {
-      // We get TERMINATE flag, i.e. by taking from a channel that ended using `take` (and not `takem` used to trap End of channels)
-      result = is.func(iterator.return) ? iterator.return() : { done: true }
-    } else {
-      result = iterator.next(arg)
-    }
-
-    if (!result.done) {
-      digestEffect(result.value, parentEffectId, next)
-    } else {
-      /**
-        This Generator has ended, terminate the main task and notify the fork queue
-      **/
-      if (mainTask.status !== CANCELLED) {
-        mainTask.status = DONE
-      }
-      mainTask.cont(result.value)
-    }
-  }
-  next();
+dispatch({
+  type: 'MY_TAKE1'
+});
+// ...
+dispatch({
+  type: 'MY_TAKE2'
+});
 ```
 
-这里的next是saga自己定义的next，不是redux中间件的next。
+我们希望这段代码的作用是：当遇见第一个yield时，程序停住，并等待一个type:MY_TAKE1的action发出，接收到这个action之后程序恢复运行，知道遇到下一个yield并等待MY_TAKE2的action发出以便程序继续运行。我们来看下这个过程的实现
 
-next函数首先判断是否要终止,如果是直接iterator.return掉。如果还不需要中止，调用iterator.next()
+忽略掉task相关的东西，我们发现这里的实现方式和co函数很像。
+定一个next，执行迭代器的next方法，判断迭代器是否实行完成，如果没有完成就调用runEffect，并把next自身作为参数传入runEffect
 
-如果iterator还没有done调用digestEffect(result.value, parentEffectId, next) 并把result.value和next函数自身传进去
+```javascript
+export default function proc(env, iterator, parentContext, cont) {
+  const mainTask = {
+    // cont: **will be set when passed to ForkQueue**
+    isRunning: true,
+    isCancelled: false,
+    cancel() {
+      if (mainTask.isRunning && !mainTask.isCancelled) {
+        mainTask.isCancelled = true
+        next(TASK_CANCEL)
+      }
+    },
+  }
+  const task = new Task(mainTask, Object.create(parentContext))
+  task.cont = cont
+  cont.cancel = task.cancel
+  next()
 
-在digestEffect里面定义了currCb并对next增加了cancel功能， 最后调用finalRunEffect，这里的finalRunEffect在createSagaMiddle没有传入middleares的情况下就是runEffect函数
+  return task
+
+  // region function-definitions
+  function next(arg, isErr) {
+    console.assert(mainTask.isRunning, 'Trying to resume an already finished generator')
+
+    try {
+      let result
+      if (isErr) {
+        result = iterator.throw(arg)
+      } else if (arg === TASK_CANCEL) {
+        mainTask.isCancelled = true
+        next.cancel()
+        result = is.func(iterator.return)
+          ? iterator.return(TASK_CANCEL)
+          : { done: true, value: TASK_CANCEL }
+      } else {
+        result = iterator.next(arg)
+      }
+
+      if (!result.done) {
+        runEffect(result.value, next)
+      } else {
+        mainTask.isRunning = false
+        mainTask.cont(result.value)
+      }
+    } catch (error) {
+      if (mainTask.isCancelled) {
+        console.error(EXCEPTION_DURING_CANCELLATION, error)
+      }
+      mainTask.isRunning = false
+      mainTask.cont(error, true)
+    }
+  }
+
+  function runEffect(effect, cb) {
+    if (is.promise(effect)) {
+      resolvePromise(effect, cb)
+    } else if (is.iterator(effect)) {
+      resolveIterator(effect, cb)
+    } else if (is.effect(effect)) {
+      const runner = effectRunnerMap[effect.type]
+      runner(env, task, effect.payload, cb, { runEffect })
+    } else {
+      cb(effect)
+    }
+  }
+
+  function resolvePromise(promise, cb) {
+    const cancelPromise = promise[CANCEL]
+    if (is.func(cancelPromise)) {
+      cb.cancel = cancelPromise
+    }
+    promise.then(cb, error => cb(error, true))
+  }
+
+  function resolveIterator(iterator, cb) {
+    proc(env, iterator, task.taskContext, cb)
+  }
+  // endregion
+}
+```
 
 我们来看下runEffect函数
 
 ```javascript
-function runEffect(effect, effectId, currCb) {
-    /**
-      each effect runner must attach its own logic of cancellation to the provided callback
-      it allows this generator to propagate cancellation downward.
-
-      ATTENTION! effect runners must setup the cancel logic by setting cb.cancel = [cancelMethod]
-      And the setup must occur before calling the callback
-
-      This is a sort of inversion of control: called async functions are responsible
-      of completing the flow by calling the provided continuation; while caller functions
-      are responsible for aborting the current flow by calling the attached cancel function
-
-      Library users can attach their own cancellation logic to promises by defining a
-      promise[CANCEL] method in their returned promises
-      ATTENTION! calling cancel must have no effect on an already completed or cancelled effect
-    **/
+function runEffect(effect, cb) {
     if (is.promise(effect)) {
-      resolvePromise(effect, currCb)
+      resolvePromise(effect, cb)
     } else if (is.iterator(effect)) {
-      // resolve iterator
-      proc(env, effect, task.context, effectId, meta, /* isRoot */ false, currCb)
-    } else if (effect && effect[IO]) {
-      const effectRunner = effectRunnerMap[effect.type]
-      effectRunner(env, effect.payload, currCb, executingContext)
+      resolveIterator(effect, cb)
+    } else if (is.effect(effect)) {
+      const runner = effectRunnerMap[effect.type]
+      runner(env, task, effect.payload, cb, { runEffect })
     } else {
-      // anything else returned as is
-      currCb(effect)
+      cb(effect)
     }
-  }
+}
 ```
 
-可以看到我们yield的东西可以是Promise，iterator，effect指令或者是其他东西。
+如果传入的类型是promise,即yield一个promise
 
-我们这里先只考虑通过call take等函数生成的effect
+```javascript
+yield PromiseInstance
+```
 
-接着我们会根据effect type来执行不同的effectRunner
+会按照处理promise的方式处理effect，这里可以参考上面的 能处理promise的co函数。
+如果传入另外一个generator，会递归的执行proc
+
+我们这里先只考虑通过take函数生成的effect
+effectRunnerMap[effect.type]会根据effect type来执行不同的effectRunner
 
 ```javascript
 const effectRunnerMap = {
@@ -213,37 +331,19 @@ const effectRunnerMap = {
 }
 ```
 
-我们先看一下最常用的take put
+我们先看一下最常用的take, put, call
+
+#### call
+
+假设有这么一段函数
 
 ```javascript
-
-function runTakeEffect(env, { channel = env.channel, pattern, maybe }, cb) {
-  const takeCb = input => {
-    if (input instanceof Error) {
-      cb(input, true)
-      return
-    }
-    if (isEnd(input) && !maybe) {
-      cb(TERMINATE)
-      return
-    }
-    cb(input)
-  }
-  try {
-    channel.take(takeCb, is.notUndef(pattern) ? matcher(pattern) : null)
-  } catch (err) {
-    cb(err, true)
-    return
-  }
-  cb.cancel = takeCb.cancel
-}
+yield call(fetchUser, userId)
 ```
 
-我们先忽略掉channel.take里面的细节,目前我们只需要知道channel.take里面最终会执行takeCb, takeCb里面执行传入的cb，也就是我们上面定义的next函数。
-
-这样我们就实现了generator的自动执行，和co函数不同的是，我们这里的两次递归调用之间加了很多逻辑。
-
-值得注意的是call effect
+进入到runCallEffect里面,这里的fn和args就是fetchUser和userId
+这里的处理方式和runEffect里差不多，如果是promise也调用了resolvePromise
+强调一下 这里的cb是自己定义的next
 
 ```javascript
 function runCallEffect(env, { context, fn, args }, cb, { task }) {
@@ -269,18 +369,178 @@ function runCallEffect(env, { context, fn, args }, cb, { task }) {
 }
 ```
 
-yield call(fn)里的fn如果还是返回一个iterator,这里就会递归调用proc
-
-在fork effect里也会递归调用proc，用于生成child_saga
+resolvePromise里按正常处理promie的方法，递归的调用了next()
 
 ```javascript
+function resolvePromise(promise, cb) {
+  const cancelPromise = promise[CANCEL]
+
+  if (is.func(cancelPromise)) {
+    cb.cancel = cancelPromise
+  }
+
+  promise.then(cb, error => {
+    cb(error, true)
+  })
+}
+```
+
+```javascript
+const res1 = yield call(xxx);
+const res2 = yield call(xxx);
+const res3 = yield call(xxx);
+```
+
+这样上面的这段代码就实现了自动执行
+
+#### take
+
+而take指令不会自动往下执行，而是等待一个action，显然是在两次递归中间加了一些东西
+
+```javascript
+function runTakeEffect(env, { channel = env.channel, pattern, maybe }, cb) {
+  const takeCb = input => {
+    if (input instanceof Error) {
+      cb(input, true)
+      return
+    }
+    if (isEnd(input) && !maybe) {
+      cb(TERMINATE)
+      return
+    }
+    cb(input)
+  }
+  try {
+    channel.take(takeCb, is.notUndef(pattern) ? matcher(pattern) : null)
+  } catch (err) {
+    cb(err, true)
+    return
+  }
+  cb.cancel = takeCb.cancel
+}
+```
+
+take里面调用了channel.take(takeCb≈next)
+先不管，再看一下put指令
+
+#### put
+
+```javascript
+function runPutEffect(env, { channel, action, resolve }, cb) {
+  /**
+   Schedule the put in case another saga is holding a lock.
+   The put will be executed atomically. ie nested puts will execute after
+   this put has terminated.
+   **/
+  asap(() => {
+    let result
+    try {
+      result = (channel ? channel.put : env.dispatch)(action)
+    } catch (error) {
+      cb(error, true)
+      return
+    }
+
+    if (resolve && is.promise(result)) {
+      resolvePromise(result, cb)
+    } else {
+      cb(result)
+    }
+  })
+  // Put effects are non cancellables
+}
+```
+
+put里调用了(channel.put || dispatch)(action)
+
+两个effect都用到了channel，我们看看channel是啥
+
+### 4. 监听和派发-通道(Channel)
+
+我们回到middleware的代码中
+
+```javascript
+return next => action => {
+  if (sagaMonitor && sagaMonitor.actionDispatched) {
+    sagaMonitor.actionDispatched(action)
+  }
+  const result = next(action) // hit reducers
+  channel.put(action)
+  return result
+}
+```
+
+发现每次dispatch都是调用到chaneel.put
+
+两边分别调用了channel.take()和channel.put()。这里利用管道实现了发布订阅，每订阅一个事件就放入管道中，如果监听到了发布的事件就从管道中移除。
+channel.js 提供了三种不同的channel,saga默认使用stdChannel,即标准管道
+
+```javascript
+// stdChannel
+const stdChannel = () => {
+  let currentTakers = [];
+  function take(taker, matcher){
+    taker['MATCH'] = matcher;
+    taker.cancel = () => {
+      currentTakers = currentTakers.filter(item => item !== taker);
+    }
+    currentTakers.push(taker);
+  }
+  function put(input) {
+    currentTakers.forEach(taker => {
+      if(taker['MATCH'](input)) {
+        taker.cancel();
+        taker(input);
+      }
+    });
+  }
+  return { take, put }
+}
+```
+
+[演示channelDemo.js]()
+
+take的时候往takers里push taker，taker是一个你想监听到订阅后执行的回调函数，并在taker上挂载cancel方法和MATCHER属性，cancel的作用是把当前taker从takers里移除，MATCHER属性是一个自定义的方法，用来匹配pattern
+put的时候，接收你要监听的时间，遍历takers，通过taker上的MATCH判断是否匹配，如果是执行taker
+
+### 非阻塞执行-fork
+
+上面的几个指令 take put take等都会中断程序的运行，等待时机恢复
+
+如果仅仅有这几种指令,我们在执行一大段逻辑的时候,代码可能是下面的写法,显然这种阻塞的写法不能适用复杂的业务
+
+```javascript
+function* saga() {
+  yield take('ACTION_1');
+  // some code
+  yield take('ACTION_2');
+  // some code
+  yield take('ACTION_3');
+  // some code
+}
+```
+
+我们希望有多个子saga,每个saga运行自己的逻辑,并且在程序开始运行时就加载这些sagas,redux-saga提供了fork effect来执行非阻塞指令
+
+```javascript
+function* saga() {
+  yield fork(saga1);
+  yield fork(saga2);
+  yield fork(saga3);
+}
+```
+
+fork函数接收一个新的generator,返回的指令是: {type: 'FORK', payload: {args, fn: f* saga1()}}
+
+首先我们来看下forkEffectRunner
+
+```javascript
+
 function runForkEffect(env, { context, fn, args, detached }, cb, { task: parent }) {
   const taskIterator = createTaskIterator({ context, fn, args })
   const meta = getIteratorMetaInfo(taskIterator, fn)
-
   immediately(() => {
     const child = proc(env, taskIterator, parent.context, currentEffectId, meta, detached, undefined)
-
     if (detached) {
       cb(child)
     } else {
@@ -298,304 +558,183 @@ function runForkEffect(env, { context, fn, args, detached }, cb, { task: parent 
 }
 ```
 
-这样我们通过proc和next的双重递归，实现了iterator的自动执行和多个saga的执行
+fn是被fork的generator函数，首先调用createTaskIterator生成一个迭代器，当然你也可以传一个普通函数，createTaskIterator会把它包装成一个迭代器。我们看到在runForkEffect里面递归调用了proc，这样就启动了子迭代器。
 
-### 4. 监听和派发-通道(Channel)
-
-解决了组合saga和自动执行iterator之后，我们还有个问题没有处理。那就是怎么把PUT出去的指令在TAKE那里接收到，以及接收到指令之后怎么dispatch到redux的reducer
-
-Channel用到了ringBuffer(圆形缓冲区,也称作圆形队列（circular queue），循环缓冲区（cyclic buffer），环形缓冲区（ring buffer）)的数据结构，现在简单介绍一下
-
-如下图所示，每一个格子都是一个缓存区，首位相连构成一个环形
-![alt 属性文本](./static/ringBuffer.png)
+通常在复杂应用中，我们会多次运行fork，比如
 
 ```javascript
-
-function ringBuffer(limit = 10) {
-  console.log('init limit:', limit);
-  let arr = new Array(limit)
-  let length = 0
-  let pushIndex = 0
-  let popIndex = 0
-
-  const push = it => {
-    arr[pushIndex] = it
-    pushIndex = (pushIndex + 1) % limit
-    length++
+  function* main() {
+    yield fork(child1);
+    yield fork(child2);
+    // ...
+  }
+  function* child1() {
+    yield fork(grandChild1);
+    yield fork(grandChild2);
   }
 
-  const take = () => {
-    if (length != 0) {
-      let it = arr[popIndex]
-      arr[popIndex] = null
-      length--
-      popIndex = (popIndex + 1) % limit
-      return it
-    }
+  function* child2() {
+    // ...
   }
-
-  const flush = () => {
-    let items = []
-    while (length) {
-      items.push(take())
-    }
-    return items
-  }
-
-  return {
-    isEmpty: () => length == 0,
-    put: it => {
-      if (length < limit) {
-        push(it)
-      } else {
-        let doubledLimit
-        doubledLimit = 2 * limit
-        arr = flush()
-        length = arr.length
-        pushIndex = arr.length
-        popIndex = 0
-        arr.length = doubledLimit
-        limit = doubledLimit
-        push(it)
-      }
-    },
-    take,
-    flush,
-    show: () => {
-      console.log(arr);
-    },
-  }
-}
-
-const buffer = ringBuffer(5);
-for (let i = 0; i < 10; i++ ) {
-  buffer.put(i + 1);
-}
-console.log(buffer.take());
-console.log(buffer.take());
-buffer.show();
-buffer.put('x');
-buffer.show();
-
 ```
 
-Channel
+如果我们将所有父子关系描述出来的话，可以得到类似下面的saga树
+![alt saga tree](./static/sagaTree.png)
+
+其实到目前为止，已经能实现大多数需求了，但是我们还想对saga树做一个增强。
+fork模式还应该具有以下特性(节选自官方文档: [fork model](https://redux-saga.js.org/docs/advanced/ForkModel.html))
+
+完成：一个 saga 实例在满足以下条件之后进入完成状态:
+*迭代器自身的语句执行完成
+*所有的 child-saga 进入完成状态
+
+<h5>当一个节点的所有子节点完成时，且自身迭代器代码执行完毕时，该节点才算完成</h5>
+
+错误传播：一个 saga 实例在以下情况会中断并抛出错误：
+
+* 迭代器自身执行时抛出了异常
+* 其中一个 child-saga 抛出了错误
+
+<h5>当一个节点发生错误时，错误会沿着树向根节点向上传播，直到某个节点捕获该错误。</h5>
+
+取消：取消一个 saga 实例也会导致以下事情的发生：
+
+* 取消 mainTask，也就是取消当前 saga 实例等待的 effect
+* 取消所有仍在执行的 child-saga
+
+<h5>取消一个节点时，该节点对应的整个子树都将被取消</h5>
+
+### ForkQueue
+
+ForkQueue是对fork模式的具体实现
+
+首先定义一下任务，这里的任务是一个对象，描述了对应的saga，比如定义isRunning，isCancelled，isAborted等属性描述saga状态，定义cancel等方法结束当前saga。
+
+现在我们回到之前的代码,在proc函数里调用了new Task生成了任务
 
 ```javascript
-export function channel(buffer = buffers.expanding()) {
-  let closed = false
-  let takers = []
+class Task {
+  isRunning = true
+  isCancelled = false
+  isAborted = false
+  result = undefined
+  error = undefined
+  joiners = []
 
-  if (process.env.NODE_ENV !== 'production') {
-    check(buffer, is.buffer, INVALID_BUFFER)
+  _deferredEnd = null
+
+  // cont will be set after calling constructor()
+  cont = undefined
+
+  constructor(mainTask, taskContext) {
+    this.taskQueue = new ForkQueue(mainTask)
+    this.taskQueue.cont = this.end
+    this.taskContext = taskContext
   }
 
-  function checkForbiddenStates() {
-    if (closed && takers.length) {
-      throw internalErr(CLOSED_CHANNEL_WITH_TAKERS)
-    }
-    if (takers.length && !buffer.isEmpty()) {
-      throw internalErr('Cannot have pending takers with non empty buffer')
+  cancel = () => {
+    if (this.isRunning && !this.isCancelled) {
+      this.isCancelled = true
+      this.taskQueue.cancelAll()
+      this.end(TASK_CANCEL)
     }
   }
 
-  function put(input) {
-    if (process.env.NODE_ENV !== 'production') {
-      checkForbiddenStates()
-      check(input, is.notUndef, UNDEFINED_INPUT_ERROR)
-    }
-
-    if (closed) {
-      return
-    }
-    if (takers.length === 0) {
-      return buffer.put(input)
-    }
-    const cb = takers.shift()
-    cb(input)
-  }
-
-  function take(cb) {
-    if (process.env.NODE_ENV !== 'production') {
-      checkForbiddenStates()
-      check(cb, is.func, "channel.take's callback must be a function")
-    }
-
-    if (closed && buffer.isEmpty()) {
-      cb(END)
-    } else if (!buffer.isEmpty()) {
-      cb(buffer.take())
+  end = (result, isErr) => {
+    this.isRunning = false
+    if (!isErr) {
+      this.result = result
+      this._deferredEnd && this._deferredEnd.resolve(result)
     } else {
-      takers.push(cb)
-      cb.cancel = () => {
-        remove(takers, cb)
-      }
+      this.error = result
+      this.isAborted = true
+      this._deferredEnd && this._deferredEnd.reject(result)
     }
+
+    this.cont(result, isErr)
+    this.joiners.forEach(j => j.cb(result, isErr))
+    this.joiners = null
   }
 
-  function flush(cb) {
-    if (process.env.NODE_ENV !== 'production') {
-      checkForbiddenStates()
-      check(cb, is.func, "channel.flush' callback must be a function")
+  toPromise() {
+    if (this._deferredEnd) {
+      return this._deferredEnd.promise
     }
 
-    if (closed && buffer.isEmpty()) {
-      cb(END)
-      return
-    }
-    cb(buffer.flush())
-  }
+    const def = deferred()
+    this._deferredEnd = def
 
-  function close() {
-    if (process.env.NODE_ENV !== 'production') {
-      checkForbiddenStates()
-    }
-
-    if (closed) {
-      return
-    }
-
-    closed = true
-
-    const arr = takers
-    takers = []
-
-    for (let i = 0, len = arr.length; i < len; i++) {
-      const taker = arr[i]
-      taker(END)
-    }
-  }
-
-  return {
-    take,
-    put,
-    flush,
-    close,
-  }
-}
-```
-
-### 5. 任务管理-Task Queue
-
-每次执行proc函数时总会调用
-
-```javascript
-/** 创建一个主任务用来追溯主流程 */
-  const mainTask = { meta, cancel: cancelMain, status: RUNNING }
-  /**
-   * 为当前generator创建工作描述符
-   * 这里的任务是主任务和fork任务的集合
-   **/
-  const task = newTask(env, mainTask, parentContext, parentEffectId, meta, isRoot, cont)
-```
-
-这时mainTask上有了cancelMain和cont两个方法，cont是continue的缩写，意味着当前iterator迭代完的后续动作
-
-cancelMain调用next(Symbol('TASK_CANCEL')) 最终调用的是各个effectRunner自己的cancel方法。
-cont方法如下所示，在迭代完iterator之后执行
-
-```javascript
-function cancelMain() {
-  if (mainTask.status === RUNNING) {
-    mainTask.status = CANCELLED
-    next(TASK_CANCEL)
-  }
-}
-function next() {
-  // ...
-    if (!result.done) {
-        digestEffect(result.value, parentEffectId, next)
+    if (!this.isRunning) {
+      if (this.isAborted) {
+        def.reject(this.error)
       } else {
-        /**
-          This Generator has ended, terminate the main task and notify the fork queue
-        **/
-      if (mainTask.status !== CANCELLED) {
-        mainTask.status = DONE
+        def.resolve(this.result)
       }
-      mainTask.cont(result.value)
     }
-  // ...
+    return def.promise
+  }
 }
 ```
 
-cont是在执行newTask时挂载在mainTask上的,我们来看下调用newTask时是如何创建任务队列的:
+在每次生成一个task的时候我们调用forkQueue把当前task push到task队列中，并对每一个task挂载cont方法，即该task完成后要执行的方法。该方法把自己从队列中移除，并在队列中的task全部移除时通过queue.cont向父任务发送完成通知。同样的，发生错误或手动中止时会清空队列并向父任务发送通知。
 
 ```javascript
- /**
-  * 用来追溯父任务和它的forks
-  * 在fork模式下，fork的任务被默认挂在在父任务下
-  * 我们通过父任务和主任务来实现它
-  * 主任务是当前generator的主要工作流，父任务是主任务和他所有fork任务的集合。
-  * 因此，整个模式表示的是有多个分支的执行树
-  * 
-  * 一个父任务有以下特性:
-  * - 它所有fork的任务都完成或者取消，它也会完成
-  * - 如果父任务取消，所有fork任务也取消
-  * - 如果fork任务抛出任何未捕捉的异常，父任务会中止
-  * - 如果父任务完成，那返回值就是主任务的返回值?
-  * 
-  */
-export default function forkQueue(mainTask, onAbort, cont) {
-  let tasks = []
-  let result
-  let completed = false
+class ForkQueue {
+  tasks = []
+  result = undefined
+  completed = false
 
-  addTask(mainTask)
-  const getTasks = () => tasks
+  // cont will be set after calling constructor()
+  cont = undefined
 
-  function abort(err) {
-    onAbort()
-    cancelAll()
-    cont(err, true)
+  constructor(mainTask) {
+    this.mainTask = mainTask
+    this.addTask(this.mainTask)
   }
 
-  function addTask(task) {
-    tasks.push(task)
+  abort(err) {
+    this.cancelAll()
+    this.cont(err, true)
+  }
+
+  addTask(task) {
+    this.tasks.push(task)
     task.cont = (res, isErr) => {
-      if (completed) {
+      if (this.completed) {
         return
       }
 
-      remove(tasks, task)
+      remove(this.tasks, task)
       task.cont = noop
       if (isErr) {
-        abort(res)
+        this.abort(res)
       } else {
-        if (task === mainTask) {
-          result = res
+        if (task === this.mainTask) {
+          this.result = res
         }
-        if (!tasks.length) {
-          completed = true
-          cont(result)
+        if (this.tasks.length === 0) {
+          this.completed = true
+          this.cont(this.result)
         }
       }
     }
   }
 
-  function cancelAll() {
-    if (completed) {
+  cancelAll() {
+    if (this.completed) {
       return
     }
-    completed = true
-    tasks.forEach(t => {
+    this.completed = true
+    this.tasks.forEach(t => {
       t.cont = noop
       t.cancel()
     })
-    tasks = []
-  }
-
-  return {
-    addTask,
-    cancelAll,
-    abort,
-    getTasks,
+    this.tasks = []
   }
 }
 ```
 
-每次调用forkQueue都会往tasks里push一个新的task，并挂载上cont方法，并判断当前task队列是否完成，如果没有完成就把当前task移除队列，如果队列为空就标记完成
-
-任务队列和父子saga之间的关系如图
+至此，整体的流程如下图所示
 ![alt 属性文本](./static/taskQueue.jpg)
 
 一个例子看下task的运行
@@ -608,6 +747,42 @@ function* Parent() {
 }
 ```
 
+[演示SageTask.js]()
+
 ![alt 属性文本](./static/taskExample.jpg)
 
+### Helpers
+
+基于fork, take等低阶指令，我们可以写出很多好用的辅助函数
+
+#### takeEvery
+
+```javascript
+import {fork, take} from "redux-saga/effects"
+
+const takeEvery = (pattern, saga, ...args) => fork(function*() {
+  while (true) {
+    const action = yield take(pattern)
+    yield fork(saga, ...args.concat(action))
+  }
+})
+```
+
+```javascript
+import {cancel, fork, take} from "redux-saga/effects"
+
+const takeLatest = (pattern, saga, ...args) => fork(function*() {
+  let lastTask
+  while (true) {
+    const action = yield take(pattern)
+    if (lastTask) {
+      yield cancel(lastTask) // 如果任务已经结束，则 cancel 为空操作
+    }
+    lastTask = yield fork(saga, ...args.concat(action))
+  }
+})
+```
+
 ### 6.总结
+
+谢谢朋友们
